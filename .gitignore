@@ -1,0 +1,10 @@
+node_modules/
+logs/
+*.log
+.env
+tmp/
+.DS_Store
+-e .secrets/
+
+-e 
+.secrets/
