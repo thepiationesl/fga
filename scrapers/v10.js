@@ -11,7 +11,7 @@ function generateRandomId(length = 16) {
 
 async function handleV10(req, res) {
   const source = req.method === 'GET' ? req.query : req.body;
-  const { userMessage, messages, ...rest } = source || {};
+  const { userMessage, messages, tools, tool_choice, ...rest } = source || {};
 
   const rawMessage = source ? (userMessage || source.message || source.prompt || source.q) : undefined;
   const msgStr = Array.isArray(rawMessage) ? rawMessage[0] : rawMessage;
@@ -46,6 +46,9 @@ async function handleV10(req, res) {
     });
   }
 
+  // Apply memory trimming
+  messagesToSend = trimConversationHistory(messagesToSend);
+
   if (messagesToSend.length === 0) {
     return res.status(400).json({ error: 'Message content is required (userMessage or messages array)' });
   }
@@ -56,10 +59,16 @@ async function handleV10(req, res) {
     'user-agent': 'ai-sdk/5.0.55 runtime/browser'
   };
 
+  // Convert messages to PublicAI format
+  const publicAiMessages = messagesToSend.map(m => {
+    const content = m.parts?.map(p => p.text).join('') || m.content || '';
+    return { role: m.role, content };
+  });
+
   const payload = {
-    tools: {},
+    tools: {},  // PublicAI doesn't support tools natively
     id: generateRandomId(16),
-    messages: messagesToSend,
+    messages: publicAiMessages,
     trigger: 'submit-message'
   };
 

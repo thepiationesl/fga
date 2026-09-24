@@ -19,21 +19,14 @@ const CONFIG = {
   }
 };
 
-// In-memory token cache to prevent redundant HTTP network requests on every request.
-// Saves ~50-300ms latency per chat invocation by reusing the token until expiration.
 let cachedTokenData = null;
 let tokenFetchPromise = null;
 
-/**
- * Retrieves the access token, using an in-memory cache when valid.
- * Deduplicates concurrent requests and handles expiration buffering.
- */
 async function getToken(forceRefresh = false) {
   if (!forceRefresh && cachedTokenData && cachedTokenData.expiresAt > Date.now()) {
     return cachedTokenData.token;
   }
 
-  // Deduplicate concurrent token requests
   if (tokenFetchPromise) {
     return tokenFetchPromise;
   }
@@ -62,8 +55,7 @@ async function getToken(forceRefresh = false) {
         throw new Error('Failed to retrieve access token from Chat Smith auth');
       }
 
-      // Calculate expiration time with a 5-minute safety buffer before token expiry
-      let expiresAt = Date.now() + 60 * 60 * 1000; // Default 1 hour fallback
+      let expiresAt = Date.now() + 60 * 60 * 1000;
       if (data?.AccessTokenExpiration) {
         const expTime = new Date(data.AccessTokenExpiration).getTime();
         if (!isNaN(expTime)) {
@@ -71,11 +63,7 @@ async function getToken(forceRefresh = false) {
         }
       }
 
-      cachedTokenData = {
-        token: accessToken,
-        expiresAt
-      };
-
+      cachedTokenData = { token: accessToken, expiresAt };
       return accessToken;
     } finally {
       tokenFetchPromise = null;
@@ -85,9 +73,8 @@ async function getToken(forceRefresh = false) {
   return tokenFetchPromise;
 }
 
-// API Route v6 - Vulcan Labs / Chat Smith
 router.post('/', async (req, res) => {
-  const { userMessage, messages } = req.body || {};
+  const { userMessage, messages, tools, tool_choice } = req.body || {};
 
   let messagesToSend = [];
 
@@ -114,6 +101,15 @@ router.post('/', async (req, res) => {
   try {
     let accessToken = await getToken();
 
+    // Build tools array for upstream if provided
+    let upstreamTools = undefined;
+    if (Array.isArray(tools) && tools.length > 0) {
+      upstreamTools = tools.map(t => ({
+        type: 'function',
+        function: t.function
+      }));
+    }
+
     const payload = {
       usage_model: {
         provider: 'openai',
@@ -122,13 +118,8 @@ router.post('/', async (req, res) => {
       user: CONFIG.DEVICE_ID,
       messages: messagesToSend,
       nsfw_check: true,
-      tools: [
-        {
-          function: {
-            name: 'create_ai_art'
-          }
-        }
-      ]
+      tools: upstreamTools,
+      tool_choice: tool_choice
     };
 
     const makeChatRequest = (token) => axios.post(CONFIG.URL.CHAT, payload, {
@@ -144,7 +135,6 @@ router.post('/', async (req, res) => {
     try {
       response = await makeChatRequest(accessToken);
     } catch (err) {
-      // If token expired or was invalidated (401 / 403), force refresh token once and retry
       if (err.response && (err.response.status === 401 || err.response.status === 403)) {
         cachedTokenData = null;
         accessToken = await getToken(true);
@@ -156,12 +146,15 @@ router.post('/', async (req, res) => {
 
     const choice = response.data?.choices?.[0];
     const reply = choice?.Message?.content || choice?.message?.content || '';
+    
+    // Pass through tool_calls from upstream if present
+    const toolCalls = choice?.message?.tool_calls || choice?.Message?.tool_calls;
 
-    if (!reply) {
-      throw new Error('No valid response content received from Chat Smith');
-    }
-
-    res.json({ reply });
+    res.json({ 
+      reply,
+      tool_calls: toolCalls,
+      model: 'chatsmith'
+    });
 
   } catch (error) {
     console.error('API v6 Request Error:', error.response ? error.response.data : error.message);

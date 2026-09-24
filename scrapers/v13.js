@@ -1,14 +1,30 @@
 const express = require('express');
 const axios = require('axios');
 const { randomUUID } = require('crypto');
+const { trimConversationHistory } = require('../utils/memory');
 
 const router = express.Router();
 
-// API Route v13 - Supabase/gpt-5-mini
-router.post('/', async (req, res) => {
-  const { userMessage } = req.body || {};
+async function handleV13(req, res) {
+  const { userMessage, messages, tools, tool_choice } = req.body || {};
 
-  if (!userMessage || typeof userMessage !== 'string') {
+  let messagesToSend = [];
+
+  if (Array.isArray(messages) && messages.length > 0) {
+    messagesToSend = messages.map(m => ({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : (m.text || JSON.stringify(m))
+    }));
+  } else if (userMessage && typeof userMessage === 'string') {
+    messagesToSend = [
+      { role: 'system', content: 'You are a helpful AI assistant.' },
+      { role: 'user', content: userMessage }
+    ];
+  }
+
+  messagesToSend = trimConversationHistory(messagesToSend);
+
+  if (messagesToSend.length === 0) {
     return res.status(400).json({ 
       error: "No message provided or message is not a string"
     });
@@ -18,7 +34,7 @@ router.post('/', async (req, res) => {
 
   try {
     const response = await axios.post(apiUrl, {
-      messages: [{ role: "user", content: userMessage }],
+      messages: messagesToSend,
       model: "openai/gpt-5-mini",
       anonymousUserId: randomUUID(),
       isContinuation: false
@@ -76,7 +92,8 @@ router.post('/', async (req, res) => {
       details: error.message
     });
   }
+}
 
-});
+router.post('/', handleV13);
 
 module.exports = router;

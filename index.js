@@ -19,6 +19,13 @@ const axios = require('axios');
 const httpClient = axios.create({ httpAgent, httpsAgent });
 const crypto = require('crypto');
 
+const {
+  generateToolCallId,
+  buildUpstreamMessages,
+  upstreamSupportsTools,
+  processUpstreamResponse
+} = require('./utils/tool-calling');
+
 function generateRandomId(length = 16) {
   return crypto.randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
 }
@@ -46,34 +53,46 @@ function pickAutoVersion() {
 
 async function callUpstream(version, payload, source) {
   const url = `http://127.0.0.1:${PORT}/chat/${version}`;
-  let userMessage = source === 'openai' ? undefined : payload.userMessage;
+  
+  // Extract messages from OpenAI format
   let messages = source === 'openai' ? payload.messages : undefined;
-
-  if (!userMessage && Array.isArray(messages) && messages.length) {
-    const last = messages[messages.length - 1];
-    if (last && typeof last.content === 'string') userMessage = last.content;
+  let userMessage = source === 'openai' ? undefined : payload.userMessage;
+  
+  if (!messages && userMessage && typeof userMessage === 'string') {
+    messages = [{ role: 'user', content: userMessage }];
+  } else if (!messages && Array.isArray(payload.messages)) {
+    messages = payload.messages;
   }
+
+  // Build upstream messages with tool support
+  const tools = payload.tools;
+  const toolChoice = payload.tool_choice;
+  const supportsTools = upstreamSupportsTools(version);
+  
+  const upstreamMessages = buildUpstreamMessages(messages || [], tools, toolChoice, supportsTools);
 
   const body = {
     userMessage,
-    messages,
+    messages: upstreamMessages,
     model: undefined,
+    tools: supportsTools ? tools : undefined,  // Only pass tools to upstreams that support them
+    tool_choice: supportsTools ? toolChoice : undefined,
     ...payload
   };
 
   const response = await httpClient.post(url, body, { timeout: 120000 });
-  const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-  const match = text.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  let reply = '';
-  if (match && match[1]) {
-    try { reply = JSON.parse(`"${match[1]}"`); } catch (_) { reply = match[1]; }
-  }
-  if (!reply) {
-    const alt = response.data?.reply;
-    if (typeof alt === 'string') reply = alt;
-  }
-  if (!reply) throw new Error('Empty upstream reply');
-  return { reply, version };
+  const upstreamData = response.data;
+  
+  // Process response through tool calling layer
+  const processed = processUpstreamResponse(upstreamData, version, tools);
+  
+  return {
+    reply: processed.content,
+    tool_calls: processed.tool_calls,
+    finish_reason: processed.finish_reason,
+    version,
+    model: upstreamData.model || VERSION_MODEL_MAP[version]
+  };
 }
 
 async function callAuto(payload, source) {
@@ -99,7 +118,10 @@ async function handleOpenAI(req, res) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const model = typeof body.model === 'string' ? body.model : 'auto';
   const stream = typeof body.stream === 'boolean' ? body.stream : false;
-  const payload = { messages, model };
+  const tools = Array.isArray(body.tools) ? body.tools : undefined;
+  const toolChoice = body.tool_choice;
+  
+  const payload = { messages, model, tools, tool_choice: toolChoice };
 
   try {
     let upstream;
@@ -111,25 +133,96 @@ async function handleOpenAI(req, res) {
       const version = MODEL_VERSION_MAP[model];
       upstream = await callUpstream(version, payload, 'openai');
     } else {
-      return res.status(400).json({ error: { message: `Model "${model}" is not available`, type: 'invalid_request_error' } });
+      return res.status(400).json({ 
+        error: { 
+          message: `Model "${model}" is not available`, 
+          type: 'invalid_request_error' 
+        } 
+      });
     }
 
-    const chatId = body.stream ? generateRandomId(20) : null;
+    const chatId = generateRandomId(20);
+    
     if (stream) {
-      const chunk = JSON.stringify({
+      res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+      res.setHeader('cache-control', 'no-cache');
+      res.setHeader('connection', 'keep-alive');
+      
+      // Send initial chunk with role
+      const initChunk = JSON.stringify({
         id: chatId,
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: upstream.model,
-        choices: [{ index: 0, delta: { content: upstream.reply }, finish_reason: null }]
+        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
       });
-      res.setHeader('content-type', 'text/event-stream; charset=utf-8');
-      res.setHeader('cache-control', 'no-cache');
-      res.setHeader('connection', 'keep-alive');
-      res.write(`data: ${chunk}\n\n`);
+      res.write(`data: ${initChunk}\n\n`);
+      
+      // Send content chunk
+      if (upstream.reply) {
+        const contentChunk = JSON.stringify({
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: upstream.model,
+          choices: [{ index: 0, delta: { content: upstream.reply }, finish_reason: null }]
+        });
+        res.write(`data: ${contentChunk}\n\n`);
+      }
+      
+      // Send tool_calls chunks if present
+      if (upstream.tool_calls && upstream.tool_calls.length > 0) {
+        for (let i = 0; i < upstream.tool_calls.length; i++) {
+          const tc = upstream.tool_calls[i];
+          const toolChunk = JSON.stringify({
+            id: chatId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: upstream.model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: i,
+                  id: tc.id,
+                  type: 'function',
+                  function: { name: tc.function.name, arguments: tc.function.arguments }
+                }]
+              },
+              finish_reason: null
+            }]
+          });
+          res.write(`data: ${toolChunk}\n\n`);
+        }
+      }
+      
+      // Final chunk
+      const finalChunk = JSON.stringify({
+        id: chatId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: upstream.model,
+        choices: [{ index: 0, delta: {}, finish_reason: upstream.finish_reason || 'stop' }]
+      });
+      res.write(`data: ${finalChunk}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       return;
+    }
+
+    // Non-streaming response
+    const choice = {
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: upstream.reply
+      },
+      finish_reason: upstream.finish_reason || 'stop'
+    };
+    
+    if (upstream.tool_calls && upstream.tool_calls.length > 0) {
+      choice.message.tool_calls = upstream.tool_calls;
+      choice.message.content = upstream.reply || null;  // Content can be null when tool_calls present
     }
 
     res.json({
@@ -137,13 +230,7 @@ async function handleOpenAI(req, res) {
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: upstream.model || model,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: upstream.reply },
-          finish_reason: 'stop'
-        }
-      ],
+      choices: [choice],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     });
   } catch (error) {
@@ -170,23 +257,21 @@ app.post('/v1/chat/completions', handleOpenAI);
 app.get('/v1/models', (req, res) => {
   const models = [
     { id: 'auto', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Auto-choose working upstream with retry' },
-    { id: 'auto', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Auto-choose working upstream with retry' },
-    { id: 'chatsmith', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Chat Smith (gpt-4o-mini)' },
+    { id: 'chatsmith', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Chat Smith (gpt-4o-mini) - supports tool calling' },
     { id: 'chatwithfiction', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Chat With Fiction' },
-    { id: 'publicai', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'PublicAI' },
-    { id: 'supabase-gpt-5-nano', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Supabase GPT-5 Nano' },
-    { id: 'supabase-gpt-5-mini', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Supabase GPT-5 Mini' },
-    { id: 'doppleai', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'DoppleAI' }
+    { id: 'publicai', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'PublicAI - simulated tool calling via prompt' },
+    { id: 'supabase-gpt-5-nano', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Supabase GPT-5 Nano - simulated tool calling via prompt' },
+    { id: 'supabase-gpt-5-mini', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'Supabase GPT-5 Mini - simulated tool calling via prompt' },
+    { id: 'doppleai', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'fga', description: 'DoppleAI - simulated tool calling via prompt' }
   ];
   res.json({ object: 'list', data: models });
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', author: 'Saksham Shekher', message: 'GPT-AI API is running', repo: 'https://github.com/OshekharO/GPT-AI' });
+  res.json({ status: 'ok', author: 'Saksham Shekher', message: 'GPT-AI API is running with tool calling support', repo: 'https://github.com/OshekharO/GPT-AI' });
 });
 
 // Mount scrapers
-
 app.use('/chat/v6', require('./scrapers/v6'));
 app.use('/chat/v8', require('./scrapers/v8'));
 app.use('/chat/v10', require('./scrapers/v10'));
@@ -197,6 +282,9 @@ app.use('/chat/v15', require('./scrapers/v15'));
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
+    console.log('Tool calling support: ENABLED');
+    console.log('Native tool calling: v6 (Chat Smith)');
+    console.log('Simulated tool calling: v8, v10, v11, v13, v15');
   });
 }
 

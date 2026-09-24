@@ -1,30 +1,49 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const { trimConversationHistory } = require('../utils/memory');
 
 const router = express.Router();
 
 async function handleV15(req, res) {
   const source = req.method === 'GET' ? req.query : req.body;
-  const { userMessage, messages, userQuery, id, chatId, username, persona_name, ...rest } = source || {};
+  const { userMessage, messages, userQuery, id, chatId, username, persona_name, tools, tool_choice, ...rest } = source || {};
 
-  let queryText = '';
+  let messagesToSend = [];
 
-  if (typeof userQuery === 'string' && userQuery) {
-    queryText = userQuery;
+  if (Array.isArray(messages) && messages.length > 0) {
+    messagesToSend = messages.map(m => ({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : (m.text || JSON.stringify(m))
+    }));
+  } else if (typeof userQuery === 'string' && userQuery) {
+    messagesToSend = [
+      { role: 'system', content: 'You are a helpful AI assistant.' },
+      { role: 'user', content: userQuery }
+    ];
   } else if (typeof userMessage === 'string' && userMessage) {
-    queryText = userMessage;
+    messagesToSend = [
+      { role: 'system', content: 'You are a helpful AI assistant.' },
+      { role: 'user', content: userMessage }
+    ];
   } else if (source && (source.message || source.prompt || source.q)) {
     const raw = source.message || source.prompt || source.q;
-    queryText = Array.isArray(raw) ? raw[0] : raw;
-  } else if (Array.isArray(messages) && messages.length > 0) {
-    const lastMsg = messages[messages.length - 1];
-    queryText = typeof lastMsg === 'string' ? lastMsg : (lastMsg.content || lastMsg.text || '');
+    const queryText = Array.isArray(raw) ? raw[0] : raw;
+    messagesToSend = [
+      { role: 'system', content: 'You are a helpful AI assistant.' },
+      { role: 'user', content: queryText }
+    ];
   }
 
-  if (!queryText || typeof queryText !== 'string') {
+  messagesToSend = trimConversationHistory(messagesToSend);
+
+  if (messagesToSend.length === 0) {
     return res.status(400).json({ error: 'Message content is required (userMessage, userQuery, or messages array)' });
   }
+
+  // Use the last user message
+  const lastUserMsg = messagesToSend.filter(m => m.role === 'user').pop();
+  const queryText = lastUserMsg?.content || '';
 
   const apiUrl = 'https://beta.dopple.ai/api/messages/send';
   const headers = {
